@@ -1,0 +1,1469 @@
+#!/usr/bin/env python3
+"""
+ELHE — Enterprise Log Hunt Engine (Enterprise-ish, Portfolio Single-File)
+========================================================================
+
+This single-file tool is meant to look and feel like a real hunting utility:
+- Parse Windows EVTX logs (Security + Sysmon Operational)
+- Normalize events into a common schema
+- Enrich events (offline) with quick context (IP type, URLs, base64 hints)
+- Run detections (rules) for:
+    * Lateral movement
+    * Privilege escalation
+    * Living-off-the-land (LOLBin) activity
+- Optional baseline/anomaly mode: highlight "NEW source IP for this user"
+- Simple process-chain correlation heuristic (Office -> script/LOLBin)
+
+It runs with ZERO args (auto-discovers common EVTX paths on Windows),
+and also supports explicit CLI arguments.
+
+Optional dependencies:
+  pip install python-evtx tqdm pyyaml
+
+Exit codes:
+  0 OK
+  1 Dependency missing (e.g., python-evtx for EVTX)
+  2 No logs found / provided
+  3 Fatal processing error
+"""
+
+from __future__ import annotations
+
+# Standard library imports
+import argparse
+import csv
+import dataclasses
+import datetime as dt
+import ipaddress
+import json
+import logging
+import os
+import re
+import sys
+from collections import Counter, defaultdict, deque
+from pathlib import Path
+from typing import Any, Callable, Deque, Dict, Iterable, List, Optional, Sequence, Tuple
+
+
+# =============================================================================
+# Exit codes (professional touch)
+# =============================================================================
+# These make automation / scripting nicer (CI jobs, scheduled tasks, etc.)
+EXIT_OK = 0
+EXIT_DEP_MISSING = 1
+EXIT_NO_LOGS = 2
+EXIT_FATAL = 3
+
+
+# =============================================================================
+# Logger setup
+# =============================================================================
+# Using a named logger allows controlled verbosity and easier integration.
+log = logging.getLogger("elhe")
+
+
+def setup_logging(verbose: bool, quiet: bool) -> None:
+    """
+    Configure log level + format based on CLI flags.
+    """
+    if quiet:
+        level = logging.ERROR
+    elif verbose:
+        level = logging.DEBUG
+    else:
+        level = logging.INFO
+
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+    )
+
+
+# =============================================================================
+# Optional dependencies
+# =============================================================================
+# We keep the tool usable even when optional deps are missing.
+# - python-evtx is REQUIRED to parse EVTX logs
+# - tqdm is OPTIONAL for progress bars
+# - pyyaml is OPTIONAL for config files (yaml)
+EVTX_AVAILABLE = False
+ET = None
+
+try:
+    # python-evtx provides the EVTX class for reading Windows event logs
+    from Evtx.Evtx import Evtx  # type: ignore
+
+    # xml.etree handles the XML inside each EVTX record
+    import xml.etree.ElementTree as _ET
+
+    ET = _ET
+    EVTX_AVAILABLE = True
+except Exception:
+    EVTX_AVAILABLE = False
+    ET = None
+
+TQDM_AVAILABLE = False
+tqdm = None
+try:
+    from tqdm import tqdm as _tqdm  # type: ignore
+
+    tqdm = _tqdm
+    TQDM_AVAILABLE = True
+except Exception:
+    TQDM_AVAILABLE = False
+    tqdm = None
+
+YAML_AVAILABLE = False
+yaml = None
+try:
+    import yaml as _yaml  # type: ignore
+
+    yaml = _yaml
+    YAML_AVAILABLE = True
+except Exception:
+    YAML_AVAILABLE = False
+    yaml = None
+
+
+# =============================================================================
+# Normalized Event Model
+# =============================================================================
+# This dataclass is the backbone of the tool:
+# it maps wildly different logs into one unified schema so rules can be simple.
+@dataclasses.dataclass
+class NormEvent:
+    # Raw timestamp string (usually ISO) as it appears in the log
+    ts: str
+
+    # Parsed timestamp (timezone-aware UTC) if we could parse it, else None
+    dt: Optional[dt.datetime]
+
+    # High-level source label: "windows_evtx" or "sysmon"
+    source: str = "windows_evtx"
+
+    # Host/device that generated the event (Computer field)
+    host: str = ""
+
+    # Windows "Channel" (Security, Sysmon Operational, etc.)
+    channel: str = ""
+
+    # Provider name (e.g., Microsoft-Windows-Security-Auditing)
+    provider: str = ""
+
+    # Event ID (e.g., 4624, 4672, 7045, Sysmon 1, etc.)
+    event_id: str = ""
+
+    # User context (TargetUserName, SubjectUserName, etc.)
+    user: str = ""
+
+    # Network context (best-effort)
+    src_ip: str = ""
+    src_port: str = ""
+    dst_ip: str = ""
+    dst_port: str = ""
+
+    # Process context (best-effort)
+    process: str = ""
+    cmdline: str = ""
+    parent_process: str = ""
+
+    # A short "action" label derived from event_id
+    action: str = ""
+
+    # extras holds parsed or enriched fields that rules often want
+    extras: Dict[str, Any] = dataclasses.field(default_factory=dict)
+
+    # raw holds the parsed XML dict (System + EventData), useful for deep inspection
+    raw: Dict[str, Any] = dataclasses.field(default_factory=dict)
+
+
+# =============================================================================
+# String + time helpers
+# =============================================================================
+def iso_now() -> str:
+    """
+    Create an ISO UTC timestamp string (used as a fallback).
+    """
+    return dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+
+
+def lower(s: str) -> str:
+    """
+    Safe lowercase helper (handles None).
+    """
+    return (s or "").lower()
+
+
+def safe_str(x: Any) -> str:
+    """
+    Convert anything to a safe string for normalization.
+    """
+    if x is None:
+        return ""
+    return str(x)
+
+
+def parse_iso_any(ts: str) -> Optional[dt.datetime]:
+    """
+    Best-effort ISO parsing.
+
+    Why it matters:
+    - EVTX SystemTime is often like: 2025-12-12T12:00:00.1234567Z
+    - CLI filters use ISO timestamps too.
+
+    Output:
+    - timezone-aware UTC datetime when possible
+    - None if unparseable (we do NOT drop events just because time parsing fails)
+    """
+    if not ts:
+        return None
+
+    s = ts.strip()
+
+    # Common case: trailing Z means UTC
+    if s.endswith("Z"):
+        s = s.replace("Z", "+00:00")
+
+    try:
+        d = dt.datetime.fromisoformat(s)
+
+        # If naive, treat it as UTC
+        if d.tzinfo is None:
+            return d.replace(tzinfo=dt.timezone.utc)
+
+        # Otherwise normalize to UTC
+        return d.astimezone(dt.timezone.utc)
+    except Exception:
+        return None
+
+
+def parse_user_time(s: str) -> Optional[dt.datetime]:
+    """
+    Parse CLI --since/--until. Returns UTC-aware datetime or None.
+    """
+    d = parse_iso_any(s)
+    if d is None:
+        return None
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=dt.timezone.utc)
+    return d.astimezone(dt.timezone.utc)
+
+
+# =============================================================================
+# Offline enrichment
+# =============================================================================
+# These regex patterns give us quick context for cmdlines without internet access.
+URL_RX = re.compile(r"(?i)\bhttps?://[^\s\"']+")
+B64_RX = re.compile(r"(?i)\b[A-Za-z0-9+/]{80,}={0,2}\b")  # rough base64 blob heuristic
+SUSP_FLAGS = ("-enc", "encodedcommand", "frombase64string", "iex", "iwr", "wget", "curl", "downloadstring")
+
+
+def is_private_ip(ip: str) -> Optional[bool]:
+    """
+    Returns:
+      True  -> RFC1918 private
+      False -> public
+      None  -> invalid / missing / loopback sentinel
+    """
+    ip = (ip or "").strip()
+    if not ip or ip in ("-", "::1"):
+        return None
+    try:
+        return ipaddress.ip_address(ip).is_private
+    except Exception:
+        return None
+
+
+def enrich_event(e: NormEvent) -> None:
+    """
+    Add fast, offline enrichment that makes findings more usable:
+    - private/public IP
+    - URLs extracted from cmdline
+    - base64 blob presence
+    - suspicious flags
+    """
+    cmd = e.cmdline or ""
+    e.extras["ip_private"] = is_private_ip(e.src_ip)
+    e.extras["urls"] = URL_RX.findall(cmd)[:10]
+    e.extras["has_base64_blob"] = bool(B64_RX.search(cmd))
+
+    lc = lower(cmd)
+    e.extras["susp_flags"] = [f for f in SUSP_FLAGS if f in lc][:10]
+
+
+# =============================================================================
+# EVTX XML parsing
+# =============================================================================
+def xml_to_dict(xml_text: str) -> Dict[str, Any]:
+    """
+    Convert a Windows Event XML record into a dict with:
+      out["System"]   -> key system fields
+      out["EventData"]-> name/value pairs
+
+    Why:
+    - Rules want simple access like rec["EventData"]["LogonType"]
+    """
+    if ET is None:
+        return {"System": {}, "EventData": {}}
+
+    try:
+        root = ET.fromstring(xml_text)  # type: ignore
+    except Exception:
+        return {"System": {}, "EventData": {}}
+
+    out: Dict[str, Any] = {"System": {}, "EventData": {}}
+
+    # Parse the <System> section
+    sys_node = root.find("./System")
+    if sys_node is not None:
+        for child in list(sys_node):
+            tag = child.tag.split("}")[-1]
+
+            if tag == "TimeCreated":
+                out["System"]["TimeCreated"] = child.attrib.get("SystemTime", "")
+            elif tag == "Provider":
+                out["System"]["Provider"] = child.attrib.get("Name", "")
+            elif tag == "EventID":
+                out["System"]["EventID"] = (child.text or "").strip()
+            elif tag == "Computer":
+                out["System"]["Computer"] = (child.text or "").strip()
+            elif tag == "Channel":
+                out["System"]["Channel"] = (child.text or "").strip()
+            else:
+                # store other useful fields when present
+                if child.text and child.text.strip():
+                    out["System"][tag] = child.text.strip()
+
+    # Parse the <EventData> section
+    ed = root.find("./EventData")
+    if ed is not None:
+        for d in list(ed):
+            name = d.attrib.get("Name", "")
+            if name:
+                out["EventData"][name] = (d.text or "").strip()
+
+    return out
+
+
+def iter_evtx_records(path: str) -> Iterable[Dict[str, Any]]:
+    """
+    Yield parsed dict records from an EVTX file.
+
+    IMPORTANT:
+    - Requires python-evtx
+    - We ignore malformed records rather than crashing.
+    """
+    if not EVTX_AVAILABLE:
+        raise ImportError("python-evtx not installed")
+
+    with Evtx(path) as ev:  # type: ignore
+        for rec in ev.records():
+            try:
+                yield xml_to_dict(rec.xml())
+            except Exception:
+                continue
+
+
+def normalize_event(rec: Dict[str, Any], source_hint: str = "windows_evtx") -> NormEvent:
+    """
+    Convert raw EVTX dict into a NormEvent.
+
+    Design goal:
+    - Most fields are "best effort" (different logs name fields differently)
+    - We preserve rec in .raw for deep dives.
+    """
+    sysd = rec.get("System", {}) if isinstance(rec.get("System"), dict) else {}
+    ed = rec.get("EventData", {}) if isinstance(rec.get("EventData"), dict) else {}
+
+    # Timestamp handling (keep event even if parse fails)
+    ts = safe_str(sysd.get("TimeCreated")) or iso_now()
+    d = parse_iso_any(ts)
+
+    # Standard Windows fields
+    eid = safe_str(sysd.get("EventID")).strip()
+    host = safe_str(sysd.get("Computer"))
+    provider = safe_str(sysd.get("Provider"))
+    channel = safe_str(sysd.get("Channel"))
+
+    # Detect Sysmon vs Security based on channel/provider
+    src = source_hint
+    if "sysmon" in lower(channel) or "sysmon" in lower(provider):
+        src = "sysmon"
+
+    # User: different events use different name fields
+    user = safe_str(ed.get("TargetUserName") or ed.get("SubjectUserName") or ed.get("User") or "")
+
+    # Network: again best-effort
+    src_ip = safe_str(ed.get("IpAddress") or ed.get("SourceIp") or ed.get("SourceAddress") or "")
+    src_port = safe_str(ed.get("IpPort") or ed.get("SourcePort") or "")
+    dst_ip = safe_str(ed.get("DestAddress") or ed.get("DestinationIp") or "")
+    dst_port = safe_str(ed.get("DestPort") or ed.get("DestinationPort") or "")
+
+    # Process context: Sysmon uses Image/CommandLine; Security uses NewProcessName/CommandLine
+    process = safe_str(
+        ed.get("Image")
+        or ed.get("NewProcessName")
+        or ed.get("ProcessName")
+        or ed.get("Application")
+        or ""
+    )
+    cmdline = safe_str(ed.get("CommandLine") or "")
+    parent = safe_str(ed.get("ParentImage") or ed.get("ParentProcessName") or "")
+
+    # Fields important for detections
+    logon_type = safe_str(ed.get("LogonType"))
+    auth_pkg = safe_str(ed.get("AuthenticationPackageName") or ed.get("AuthenticationPackage") or "")
+    workstation = safe_str(ed.get("WorkstationName") or ed.get("TargetServerName") or "")
+
+    service_name = safe_str(ed.get("ServiceName") or "")
+    service_path = safe_str(ed.get("ServiceFileName") or ed.get("ImagePath") or "")
+
+    # Sysmon correlation GUIDs
+    proc_guid = safe_str(ed.get("ProcessGuid") or "")
+    parent_guid = safe_str(ed.get("ParentProcessGuid") or "")
+
+    # Simple action map to make logic readable
+    action_map = {
+        "4624": "logon_success",
+        "4625": "logon_fail",
+        "4634": "logoff",
+        "4672": "special_privileges",
+        "4688": "process_create_sec",
+        "4697": "service_install_sec",
+        "7045": "service_install",
+        "4648": "explicit_creds",
+        "4720": "user_created",
+        "4728": "group_add_global",
+        "4732": "group_add_local",
+        "4756": "group_add_universal",
+        # Sysmon
+        "1": "process_create_sysmon",
+        "3": "network_connect_sysmon",
+        "11": "file_create_sysmon",
+        "13": "registry_set_sysmon",
+    }
+    action = action_map.get(eid, "")
+
+    # Build normalized event
+    e = NormEvent(
+        ts=ts,
+        dt=d,
+        source=src,
+        host=host,
+        channel=channel,
+        provider=provider,
+        event_id=eid,
+        user=user,
+        src_ip=src_ip,
+        src_port=src_port,
+        dst_ip=dst_ip,
+        dst_port=dst_port,
+        process=process,
+        cmdline=cmdline,
+        parent_process=parent,
+        action=action,
+        extras={
+            "LogonType": logon_type,
+            "AuthPackage": auth_pkg,
+            "WorkstationName": workstation,
+            "ServiceName": service_name,
+            "ServicePath": service_path,
+            "ProcessGuid": proc_guid,
+            "ParentProcessGuid": parent_guid,
+        },
+        raw=rec,
+    )
+
+    # Add offline enrichment
+    enrich_event(e)
+    return e
+
+
+# =============================================================================
+# Rule metadata + match functions (pickle-safe)
+# =============================================================================
+@dataclasses.dataclass(frozen=True)
+class RuleMeta:
+    id: str
+    title: str
+    attack: str
+    severity: str
+    why: str
+    next_steps: str
+    tuning: str
+
+
+# Helper constants used by rules
+LOCAL_IPS = {"127.0.0.1", "::1", "-", ""}
+
+
+def _is_service_or_machine_account(user: str) -> bool:
+    """
+    Reduce false positives:
+    - machine accounts often end with $
+    - some environments prefix service accounts with svc*
+    """
+    u = (user or "").strip()
+    if not u:
+        return False
+    if u.endswith("$"):
+        return True
+    lu = lower(u)
+    return lu in {"system", "local system", "localsystem"} or lu.startswith("svc") or lu.startswith("service")
+
+
+# -----------------------------
+# Lateral movement matchers
+# -----------------------------
+def m_lm_rdp(e: NormEvent) -> bool:
+    """
+    4624 LogonType 10 is RemoteInteractive (RDP).
+    """
+    if e.event_id != "4624":
+        return False
+    if safe_str(e.extras.get("LogonType")) != "10":
+        return False
+    if e.src_ip in LOCAL_IPS:
+        return False
+    if _is_service_or_machine_account(e.user):
+        return False
+    return True
+
+
+def m_lm_smb_ntlm(e: NormEvent) -> bool:
+    """
+    4624 LogonType 3 + NTLM is often SMB/WMI/service movement (noisy).
+    """
+    if e.event_id != "4624":
+        return False
+    if safe_str(e.extras.get("LogonType")) != "3":
+        return False
+    ap = lower(safe_str(e.extras.get("AuthPackage")))
+    if "ntlm" not in ap:
+        return False
+    if e.src_ip in LOCAL_IPS:
+        return False
+    if _is_service_or_machine_account(e.user):
+        return False
+    return True
+
+
+def m_lm_explicit_creds_4648(e: NormEvent) -> bool:
+    """
+    Event 4648 occurs when explicit creds are used (runas, remote auth, etc.).
+    """
+    return e.event_id == "4648" and not _is_service_or_machine_account(e.user)
+
+
+def m_lm_psexec_7045(e: NormEvent) -> bool:
+    """
+    Event 7045 = service created.
+    PsExec often uses PSEXESVC or UNC paths.
+    """
+    if e.event_id != "7045":
+        return False
+    svc = lower(safe_str(e.extras.get("ServiceName")))
+    path = lower(safe_str(e.extras.get("ServicePath")))
+    if "psexesvc" in svc or "psexec" in svc:
+        return True
+    if path.startswith("\\\\") or "\\\\" in path:
+        return True
+    return False
+
+
+# -----------------------------
+# Privilege escalation matchers
+# -----------------------------
+def m_pe_special_privs_4672(e: NormEvent) -> bool:
+    """
+    4672 = special privileges assigned to new logon.
+    """
+    return e.event_id == "4672" and not _is_service_or_machine_account(e.user)
+
+
+def m_pe_admin_group_add(e: NormEvent) -> bool:
+    """
+    Group membership changes:
+      4728 / 4732 / 4756
+    We check GroupName text for admin-like keywords.
+    """
+    if e.event_id not in {"4728", "4732", "4756"}:
+        return False
+    ed = e.raw.get("EventData", {}) if isinstance(e.raw.get("EventData"), dict) else {}
+    group = lower(safe_str(ed.get("GroupName") or ed.get("Group") or ""))
+    if not group:
+        return False
+    keywords = ("admin", "administrators", "domain admins", "enterprise admins", "remote desktop users")
+    return any(k in group for k in keywords)
+
+
+# -----------------------------
+# LOLBin matchers
+# -----------------------------
+def m_lol_powershell(e: NormEvent) -> bool:
+    p = lower(e.process)
+    c = lower(e.cmdline)
+    return ("powershell" in p) or ("powershell" in c) or ("pwsh" in p)
+
+
+def m_lol_powershell_encoded(e: NormEvent) -> bool:
+    if "powershell" not in lower(e.process) and "powershell" not in lower(e.cmdline):
+        return False
+    lc = lower(e.cmdline)
+    return ("-enc" in lc) or ("encodedcommand" in lc)
+
+
+def m_lol_rundll32(e: NormEvent) -> bool:
+    return lower(e.process).endswith("rundll32.exe")
+
+
+def m_lol_regsvr32(e: NormEvent) -> bool:
+    return lower(e.process).endswith("regsvr32.exe")
+
+
+def m_lol_mshta(e: NormEvent) -> bool:
+    return lower(e.process).endswith("mshta.exe")
+
+
+def m_lol_certutil_download(e: NormEvent) -> bool:
+    if not lower(e.process).endswith("certutil.exe"):
+        return False
+    lc = lower(e.cmdline)
+    return "-urlcache" in lc or "http" in lc or "https" in lc
+
+
+def m_lol_bitsadmin(e: NormEvent) -> bool:
+    return lower(e.process).endswith("bitsadmin.exe")
+
+
+def m_lol_wmic_process_create(e: NormEvent) -> bool:
+    if not lower(e.process).endswith("wmic.exe"):
+        return False
+    lc = lower(e.cmdline)
+    return "process" in lc and "call" in lc and "create" in lc
+
+
+# -----------------------------
+# Suspicious commandline matcher
+# -----------------------------
+def m_susp_obfuscated_cmd(e: NormEvent) -> bool:
+    """
+    Looks for base64 blobs or heavy obfuscation markers.
+    """
+    if not e.cmdline:
+        return False
+    lc = lower(e.cmdline)
+    return e.extras.get("has_base64_blob") is True or any(k in lc for k in ("frombase64string", "encodedcommand", "iex", "invoke-expression"))
+
+
+# =============================================================================
+# Correlation (process chains)
+# =============================================================================
+@dataclasses.dataclass
+class ProcNode:
+    ts: str
+    dt: Optional[dt.datetime]
+    host: str
+    process: str
+    cmdline: str
+    parent: str
+    guid: str
+    parent_guid: str
+    user: str
+
+
+def is_susp_chain(child: ProcNode) -> bool:
+    """
+    Simple heuristic:
+      Office -> script/LOLBin
+      PowerShell -> proxy exec (rundll32/regsvr32/mshta)
+    """
+    p = lower(child.process)
+    pp = lower(child.parent)
+
+    if any(x in pp for x in ("winword.exe", "excel.exe", "powerpnt.exe", "outlook.exe")) and any(
+        x in p for x in ("powershell.exe", "wscript.exe", "cscript.exe", "mshta.exe")
+    ):
+        return True
+
+    if ("powershell.exe" in pp) and any(x in p for x in ("rundll32.exe", "regsvr32.exe", "mshta.exe")):
+        return True
+
+    return False
+
+
+@dataclasses.dataclass
+class Correlator:
+    """
+    Rolling cache of recent process nodes.
+    - by_guid enables linking to parent by ParentProcessGuid.
+    - window is used for eviction to keep memory bounded.
+    """
+    max_per_host: int = 5000
+    window: Deque[ProcNode] = dataclasses.field(default_factory=deque)
+    by_guid: Dict[str, ProcNode] = dataclasses.field(default_factory=dict)
+
+    def add(self, e: NormEvent) -> Optional[ProcNode]:
+        # Only meaningful for process creation events
+        if e.event_id not in {"1", "4688"}:
+            return None
+
+        node = ProcNode(
+            ts=e.ts,
+            dt=e.dt,
+            host=e.host,
+            process=e.process,
+            cmdline=e.cmdline,
+            parent=e.parent_process,
+            guid=safe_str(e.extras.get("ProcessGuid")),
+            parent_guid=safe_str(e.extras.get("ParentProcessGuid")),
+            user=e.user,
+        )
+
+        if node.guid:
+            self.by_guid[node.guid] = node
+
+        self.window.append(node)
+
+        # Evict old nodes to prevent memory blowups on huge logs
+        if len(self.window) > self.max_per_host:
+            old = self.window.popleft()
+            if old.guid:
+                self.by_guid.pop(old.guid, None)
+
+        return node
+
+
+# =============================================================================
+# Rule registry (metadata + match functions)
+# =============================================================================
+RULES: List[Tuple[RuleMeta, Callable[[NormEvent], bool]]] = [
+    (
+        RuleMeta(
+            id="LM-RDP-4624-LT10",
+            title="RDP logon (4624 LogonType=10) from remote source",
+            attack="T1021.001",
+            severity="high",
+            why="RDP is a common lateral movement channel after credential access.",
+            next_steps="Validate user + src IP; pivot to 4625/4648 and Sysmon EID 1 on the target host.",
+            tuning="Allowlist jump hosts; ignore machine/service accounts; use baseline to reduce noise.",
+        ),
+        m_lm_rdp,
+    ),
+    (
+        RuleMeta(
+            id="LM-SMB-NTLM-4624-LT3",
+            title="Network logon (4624 LogonType=3) using NTLM",
+            attack="T1021.002",
+            severity="medium",
+            why="NTLM network logons can indicate SMB/WMI/service movement.",
+            next_steps="Correlate with 7045/4697, Sysmon EID 1, and remote share access.",
+            tuning="Noisy—use baseline mode and allowlists for management servers.",
+        ),
+        m_lm_smb_ntlm,
+    ),
+    (
+        RuleMeta(
+            id="LM-EXPLICIT-CREDS-4648",
+            title="Explicit credentials used (4648)",
+            attack="T1078",
+            severity="medium",
+            why="4648 often appears when credentials are supplied explicitly for remote access.",
+            next_steps="Find the target server/workstation name; correlate with subsequent 4624 events.",
+            tuning="Allowlist expected automation/service accounts.",
+        ),
+        m_lm_explicit_creds_4648,
+    ),
+    (
+        RuleMeta(
+            id="LM-PSEXEC-7045",
+            title="PsExec-like service install (7045) / UNC service path",
+            attack="T1569.002",
+            severity="high",
+            why="Remote service creation is a classic lateral movement technique.",
+            next_steps="Review ServiceName/ServicePath; correlate with 4624 LT3 and Sysmon process creation around install time.",
+            tuning="Allowlist legitimate deployment tools that create services.",
+        ),
+        m_lm_psexec_7045,
+    ),
+    (
+        RuleMeta(
+            id="PE-SPECIAL-PRIVS-4672",
+            title="Special privileges assigned (4672) – privileged logon",
+            attack="T1068/T1548",
+            severity="high",
+            why="4672 indicates high-privilege token assignment and often appears after escalation or admin credential use.",
+            next_steps="Identify the account and logon type; correlate with group membership changes and suspicious process creation.",
+            tuning="Filter known admin accounts or expected maintenance windows; focus on rare sources.",
+        ),
+        m_pe_special_privs_4672,
+    ),
+    (
+        RuleMeta(
+            id="PE-ADMIN-GROUP-ADD",
+            title="Added to privileged group (4728/4732/4756)",
+            attack="T1098",
+            severity="high",
+            why="Adding a principal to admin groups is durable escalation/persistence.",
+            next_steps="Confirm who made the change and from which host; check follow-on logons/tooling.",
+            tuning="Allowlist change-management accounts if needed.",
+        ),
+        m_pe_admin_group_add,
+    ),
+    (
+        RuleMeta(
+            id="LOL-POWERSHELL",
+            title="PowerShell execution (LOLBin)",
+            attack="T1059.001",
+            severity="medium",
+            why="PowerShell is heavily abused for download/execute and in-memory tradecraft.",
+            next_steps="Look for encoded commands, suspicious parents (Office/WMI/services), and outbound connections (Sysmon 3).",
+            tuning="Baseline admin scripts; focus on rare parents + suspicious flags.",
+        ),
+        m_lol_powershell,
+    ),
+    (
+        RuleMeta(
+            id="LOL-POWERSHELL-ENC",
+            title="PowerShell encoded/obfuscated command",
+            attack="T1027",
+            severity="high",
+            why="Encoded commands are strongly associated with malicious execution and evasion.",
+            next_steps="Decode payload safely; extract IOCs; correlate with network + file writes.",
+            tuning="Rarely benign; allowlist only trusted tooling if necessary.",
+        ),
+        m_lol_powershell_encoded,
+    ),
+    (
+        RuleMeta(
+            id="LOL-RUNDLL32",
+            title="rundll32 execution (LOLBin)",
+            attack="T1218.011",
+            severity="medium",
+            why="Signed proxy execution technique frequently used in malware chains.",
+            next_steps="Inspect DLL path/exports; look for URL/UNC patterns; check parent.",
+            tuning="Baseline legitimate software; focus on Temp/AppData DLLs.",
+        ),
+        m_lol_rundll32,
+    ),
+    (
+        RuleMeta(
+            id="LOL-REGSVR32",
+            title="regsvr32 execution (LOLBin)",
+            attack="T1218.010",
+            severity="medium",
+            why="Can proxy execution in suspicious patterns.",
+            next_steps="Inspect cmdline for scriptlet/network references and parent process.",
+            tuning="Allowlist specific installers if required; focus on URLs.",
+        ),
+        m_lol_regsvr32,
+    ),
+    (
+        RuleMeta(
+            id="LOL-MSHTA",
+            title="mshta execution (LOLBin)",
+            attack="T1218.005",
+            severity="high",
+            why="Common for script execution and remote payload staging.",
+            next_steps="Inspect URLs and file writes; check parent process (Office) and network activity.",
+            tuning="Often suspicious in enterprises; allowlist only known legacy apps.",
+        ),
+        m_lol_mshta,
+    ),
+    (
+        RuleMeta(
+            id="LOL-CERTUTIL-DL",
+            title="certutil used for download/staging",
+            attack="T1105",
+            severity="high",
+            why="certutil can fetch remote content and is a common staging tool.",
+            next_steps="Extract URL + destination; correlate with execution shortly after.",
+            tuning="Allowlist only if you truly have legitimate certutil download workflows.",
+        ),
+        m_lol_certutil_download,
+    ),
+    (
+        RuleMeta(
+            id="LOL-BITSADMIN",
+            title="bitsadmin execution (LOLBin)",
+            attack="T1197",
+            severity="medium",
+            why="BITS can be used for stealthy downloads.",
+            next_steps="Check job args for remote URLs and file destinations.",
+            tuning="Often suspicious; bitsadmin is deprecated—allowlist sparingly.",
+        ),
+        m_lol_bitsadmin,
+    ),
+    (
+        RuleMeta(
+            id="LOL-WMIC-PROC-CREATE",
+            title="wmic process call create",
+            attack="T1047",
+            severity="high",
+            why="WMIC process creation is frequently used in attacker tradecraft.",
+            next_steps="Check for remote parameters; correlate with 4624 LT3 and service creation.",
+            tuning="Allowlist inventory tooling if needed; focus on unusual cmdlines.",
+        ),
+        m_lol_wmic_process_create,
+    ),
+    (
+        RuleMeta(
+            id="SUSP-OBF-CMDLINE",
+            title="Obfuscated / suspicious command line indicators",
+            attack="T1027",
+            severity="medium",
+            why="Obfuscation/base64 hints often indicate payload staging or evasion.",
+            next_steps="Decode carefully, extract IOCs, correlate with network and child processes.",
+            tuning="Tune by parent process + rare flags; allowlist known admin scripts.",
+        ),
+        m_susp_obfuscated_cmd,
+    ),
+]
+
+
+# =============================================================================
+# Config + allowlists
+# =============================================================================
+def load_config(path: str) -> Dict[str, Any]:
+    """
+    Load YAML (if available) or JSON config.
+    """
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(path)
+
+    text = p.read_text(encoding="utf-8", errors="ignore")
+
+    if p.suffix.lower() in {".yml", ".yaml"} and YAML_AVAILABLE and yaml is not None:
+        data = yaml.safe_load(text)  # type: ignore
+        return data if isinstance(data, dict) else {}
+
+    return json.loads(text)
+
+
+def load_lines_file(path: str) -> List[str]:
+    """
+    Read allowlist file (one entry per line).
+    Supports comments with #.
+    """
+    p = Path(path)
+    if not p.exists():
+        return []
+    lines = []
+    for line in p.read_text(encoding="utf-8", errors="ignore").splitlines():
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        lines.append(s)
+    return lines
+
+
+def is_allowlisted_user(user: str, allow_users: Sequence[str]) -> bool:
+    u = lower(user).strip()
+    if not u:
+        return False
+    return any(u == lower(x).strip() for x in allow_users)
+
+
+def is_allowlisted_ip(ip: str, allow_ips: Sequence[str]) -> bool:
+    s = (ip or "").strip()
+    if not s:
+        return False
+    return any(s == (x or "").strip() for x in allow_ips)
+
+
+# =============================================================================
+# Baseline model (simple but very effective)
+# =============================================================================
+@dataclasses.dataclass
+class Baseline:
+    """
+    Baseline tracks what is 'normal' (very small/simple baseline).
+    Useful for prioritizing anomalies like "new src_ip for user".
+    """
+    user_src_ips: Dict[str, Counter] = dataclasses.field(default_factory=lambda: defaultdict(Counter))
+
+    def observe(self, e: NormEvent) -> None:
+        u = lower(e.user).strip()
+        ip = (e.src_ip or "").strip()
+        if u and ip and ip not in LOCAL_IPS:
+            self.user_src_ips[u][ip] += 1
+
+    def is_new_src_for_user(self, user: str, src_ip: str, min_seen: int = 1) -> bool:
+        u = lower(user).strip()
+        ip = (src_ip or "").strip()
+        if not u or not ip:
+            return False
+        return self.user_src_ips[u][ip] < min_seen
+
+
+# =============================================================================
+# Sources
+# =============================================================================
+@dataclasses.dataclass
+class EvtxSource:
+    """
+    A wrapper around an EVTX path that yields NormEvents.
+    """
+    path: str
+    source_hint: str = "windows_evtx"
+
+    def iter_events(self, progress: bool = False) -> Iterable[NormEvent]:
+        it = iter_evtx_records(self.path)
+
+        # Optional progress bar
+        if progress and TQDM_AVAILABLE and tqdm is not None:
+            it = tqdm(it, desc=f"EVTX {Path(self.path).name}", unit="ev")  # type: ignore
+
+        for rec in it:
+            yield normalize_event(rec, self.source_hint)
+
+
+def autodiscover_evtx() -> List[str]:
+    """
+    Default Windows EVTX auto-discovery.
+    """
+    if os.name != "nt":
+        return []
+
+    base = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "winevt" / "Logs"
+    candidates = [
+        base / "Security.evtx",
+        base / "Microsoft-Windows-Sysmon%4Operational.evtx",
+    ]
+    return [str(p) for p in candidates if p.exists()]
+
+
+# =============================================================================
+# Hunt engine
+# =============================================================================
+def within_time(e: NormEvent, since: Optional[dt.datetime], until: Optional[dt.datetime]) -> bool:
+    """
+    If event dt is missing, we do NOT drop it.
+    Time filter only applies if dt is available.
+    """
+    if e.dt is None:
+        return True
+    if since and e.dt < since:
+        return False
+    if until and e.dt > until:
+        return False
+    return True
+
+
+def make_finding(meta: RuleMeta, e: NormEvent, note: str = "", confidence: str = "medium") -> Dict[str, Any]:
+    """
+    Convert a matched rule into a structured finding for output.
+    """
+    return {
+        "ts": e.ts,
+        "rule_id": meta.id,
+        "title": meta.title,
+        "attack": meta.attack,
+        "severity": meta.severity,
+        "confidence": confidence,
+        "note": note,
+        "host": e.host,
+        "user": e.user,
+        "src_ip": e.src_ip,
+        "process": e.process,
+        "cmdline": e.cmdline,
+        "enrichment": {
+            "ip_private": e.extras.get("ip_private"),
+            "urls": e.extras.get("urls"),
+            "has_base64_blob": e.extras.get("has_base64_blob"),
+            "susp_flags": e.extras.get("susp_flags"),
+            "LogonType": e.extras.get("LogonType"),
+            "AuthPackage": e.extras.get("AuthPackage"),
+            "WorkstationName": e.extras.get("WorkstationName"),
+        },
+        "triage": {
+            "why": meta.why,
+            "next_steps": meta.next_steps,
+            "tuning": meta.tuning,
+        },
+        "event": dataclasses.asdict(e),
+    }
+
+
+def hunt_sources(
+    sources: List[EvtxSource],
+    since: Optional[dt.datetime],
+    until: Optional[dt.datetime],
+    enabled_rule_ids: Optional[set],
+    disabled_rule_ids: Optional[set],
+    baseline: Optional[Baseline],
+    allow_users: Sequence[str],
+    allow_ips: Sequence[str],
+    progress: bool,
+) -> List[Dict[str, Any]]:
+    """
+    Main hunt pipeline:
+    - iterate events
+    - apply filters
+    - run correlation heuristics
+    - run rules
+    - collect findings
+    """
+    findings: List[Dict[str, Any]] = []
+    corr = Correlator()
+
+    enabled_rule_ids = enabled_rule_ids or set()
+    disabled_rule_ids = disabled_rule_ids or set()
+
+    # Determine which rules to run
+    rules_to_run: List[Tuple[RuleMeta, Callable[[NormEvent], bool]]] = []
+    for meta, fn in RULES:
+        if meta.id in disabled_rule_ids:
+            continue
+        if enabled_rule_ids and meta.id not in enabled_rule_ids:
+            continue
+        rules_to_run.append((meta, fn))
+
+    # Iterate each EVTX file
+    for src in sources:
+        log.info("Processing %s", src.path)
+
+        for e in src.iter_events(progress=progress):
+            # Time filter (best-effort)
+            if not within_time(e, since, until):
+                continue
+
+            # Allowlists (reduce known-good noise)
+            if is_allowlisted_user(e.user, allow_users):
+                continue
+            if is_allowlisted_ip(e.src_ip, allow_ips):
+                continue
+
+            # Baseline anomaly notes (adds triage value)
+            baseline_note = ""
+            confidence = "medium"
+
+            if baseline is not None:
+                if e.event_id == "4624" and e.user and e.src_ip and e.src_ip not in LOCAL_IPS:
+                    if baseline.is_new_src_for_user(e.user, e.src_ip, min_seen=1):
+                        baseline_note = "Baseline: NEW source IP for this user"
+                        confidence = "high"
+
+            # Correlation: process chain heuristic
+            node = corr.add(e)
+            if node and is_susp_chain(node):
+                findings.append({
+                    "ts": e.ts,
+                    "rule_id": "CORR-SUSP-PROC-CHAIN",
+                    "title": "Suspicious process chain (parent/child heuristic)",
+                    "attack": "T1204/T1059/T1218",
+                    "severity": "high",
+                    "confidence": "high",
+                    "note": "Heuristic chain match (Office -> script/LOLBin, or PowerShell -> proxy exec).",
+                    "host": e.host,
+                    "user": e.user,
+                    "src_ip": e.src_ip,
+                    "process": e.process,
+                    "cmdline": e.cmdline,
+                    "enrichment": {"parent": node.parent, "urls": e.extras.get("urls"), "susp_flags": e.extras.get("susp_flags")},
+                    "triage": {
+                        "why": "Attackers frequently chain signed binaries and scripts from user applications.",
+                        "next_steps": "Review parent process, file origin, email/download context; pivot to network/file events.",
+                        "tuning": "Baseline common Office add-ins and admin scripts; require URLs or suspicious flags for higher confidence.",
+                    },
+                    "event": dataclasses.asdict(e),
+                })
+
+            # Run detection rules
+            for meta, fn in rules_to_run:
+                try:
+                    if fn(e):
+                        findings.append(make_finding(meta, e, note=baseline_note, confidence=confidence))
+                except Exception:
+                    # Never let a single rule break the pipeline
+                    continue
+
+    return findings
+
+
+# =============================================================================
+# Output
+# =============================================================================
+def write_json(path: str, findings: List[Dict[str, Any]]) -> None:
+    Path(path).write_text(json.dumps(findings, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def write_jsonl(path: str, findings: List[Dict[str, Any]]) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        for item in findings:
+            f.write(json.dumps(item, ensure_ascii=False) + "\n")
+
+
+def write_csv(path: str, findings: List[Dict[str, Any]]) -> None:
+    if not findings:
+        return
+    fieldnames = ["ts", "rule_id", "title", "attack", "severity", "confidence", "host", "user", "src_ip", "process", "cmdline", "note"]
+    with open(path, "w", encoding="utf-8", newline="") as out:
+        w = csv.DictWriter(out, fieldnames=fieldnames)
+        w.writeheader()
+        for fnd in findings:
+            row = {k: fnd.get(k, "") for k in fieldnames}
+            # prevent insanely long CSV cells
+            row["cmdline"] = (row.get("cmdline") or "")[:4000]
+            w.writerow(row)
+
+
+def print_summary(findings: List[Dict[str, Any]]) -> None:
+    if not findings:
+        print("No detections fired.")
+        return
+
+    by_rule = Counter(f["rule_id"] for f in findings)
+    by_sev = Counter(f.get("severity", "unknown") for f in findings)
+    by_user = Counter(f.get("user", "") for f in findings if f.get("user"))
+    by_ip = Counter(f.get("src_ip", "") for f in findings if f.get("src_ip"))
+
+    print("\n=== Summary ===")
+    print("Rules:")
+    for rid, c in by_rule.most_common(15):
+        print(f"  {rid:<24} {c}")
+
+    print("\nSeverity:")
+    for sev, c in by_sev.most_common():
+        print(f"  {sev:<8} {c}")
+
+    if by_user:
+        print("\nTop users:")
+        print("  " + ", ".join(f"{u} ({c})" for u, c in by_user.most_common(8)))
+
+    if by_ip:
+        print("\nTop source IPs:")
+        print("  " + ", ".join(f"{ip} ({c})" for ip, c in by_ip.most_common(8)))
+
+    print("\nTop findings:")
+    for fnd in findings[:10]:
+        print(f"- {fnd['ts']} | {fnd['severity']} | {fnd['rule_id']} | {fnd['title']}")
+        print(f"  host={fnd.get('host','')} user={fnd.get('user','')} src_ip={fnd.get('src_ip','')}")
+        if fnd.get("note"):
+            print(f"  note={fnd['note']}")
+        if fnd.get("process"):
+            print(f"  proc={fnd.get('process','')}")
+        print("")
+
+
+# =============================================================================
+# Self test
+# =============================================================================
+def run_selftest() -> int:
+    """
+    Minimal deterministic tests so recruiters see you care about correctness.
+    """
+    now = dt.datetime(2025, 12, 12, 12, 0, 0, tzinfo=dt.timezone.utc)
+
+    e_rdp = NormEvent(
+        ts="2025-12-12T12:00:00Z",
+        dt=now,
+        event_id="4624",
+        user="derek",
+        src_ip="10.9.8.7",
+        host="WINHOST",
+        extras={"LogonType": "10", "AuthPackage": "Negotiate"},
+        raw={"EventData": {"LogonType": "10"}},
+    )
+    enrich_event(e_rdp)
+    assert m_lm_rdp(e_rdp) is True
+
+    e_ps = NormEvent(
+        ts="2025-12-12T12:01:00Z",
+        dt=now,
+        event_id="1",
+        user="derek",
+        host="WINHOST",
+        process=r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+        cmdline="powershell.exe -enc AAAABBBBCCCC",
+        parent_process=r"C:\Program Files\Microsoft Office\root\Office16\WINWORD.EXE",
+        extras={"ProcessGuid": "{111}", "ParentProcessGuid": "{222}"},
+    )
+    enrich_event(e_ps)
+    assert m_lol_powershell_encoded(e_ps) is True
+    assert m_susp_obfuscated_cmd(e_ps) is True
+
+    node = ProcNode(
+        ts=e_ps.ts, dt=e_ps.dt, host=e_ps.host,
+        process=e_ps.process, cmdline=e_ps.cmdline,
+        parent=e_ps.parent_process, guid="{111}",
+        parent_guid="{222}", user=e_ps.user
+    )
+    assert is_susp_chain(node) is True
+
+    print("[+] Selftest passed.")
+    return EXIT_OK
+
+
+# =============================================================================
+# CLI
+# =============================================================================
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        description="ELHE — Enterprise Log Hunt Engine (single-file)",
+        epilog="Run with no args for auto-discovery (Windows). Use --logs to specify EVTX paths.",
+    )
+    p.add_argument("--logs", nargs="+", help="EVTX log paths")
+    p.add_argument("--config", help="Config file (.yml/.yaml/.json). CLI args override config.")
+    p.add_argument("--since", help="ISO timestamp, e.g. 2025-12-01T00:00:00Z")
+    p.add_argument("--until", help="ISO timestamp")
+    p.add_argument("--baseline", action="store_true", help="Enable baseline/anomaly notes (two-pass scan).")
+    p.add_argument("--allow-users", help="File with allowlisted usernames (one per line).")
+    p.add_argument("--allow-ips", help="File with allowlisted source IPs (one per line).")
+    p.add_argument("--enable-rules", nargs="+", help="Only run these rule IDs.")
+    p.add_argument("--disable-rules", nargs="+", help="Disable these rule IDs.")
+    p.add_argument("--list-rules", action="store_true", help="List rule IDs and exit.")
+    p.add_argument("--out", help="Write findings to file.")
+    p.add_argument("--format", choices=["json", "jsonl", "csv"], default="json", help="Output format for --out")
+    p.add_argument("--progress", action="store_true", help="Show progress bar (tqdm).")
+    p.add_argument("--verbose", action="store_true")
+    p.add_argument("--quiet", action="store_true")
+    p.add_argument("--selftest", action="store_true", help="Run built-in tests and exit.")
+    return p
+
+
+def merge_config(cli: argparse.Namespace, cfg: Dict[str, Any]) -> argparse.Namespace:
+    """
+    Simple config merge:
+    - If CLI value is missing/default, fill from config.
+    - If CLI provided it, keep CLI.
+    """
+    for k, v in cfg.items():
+        name = k.replace("-", "_")
+        if not hasattr(cli, name):
+            continue
+        cur = getattr(cli, name)
+        if cur is None or cur == [] or cur is False:
+            setattr(cli, name, v)
+    return cli
+
+
+def load_config_if_present(args: argparse.Namespace) -> argparse.Namespace:
+    if not args.config:
+        return args
+    try:
+        cfg = load_config(args.config)
+        return merge_config(args, cfg)
+    except Exception as e:
+        print(f"[!] Failed to load config: {e}")
+        raise
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    args = build_parser().parse_args(argv)
+    setup_logging(args.verbose, args.quiet)
+
+    # Selftest is a fast sanity check
+    if args.selftest:
+        return run_selftest()
+
+    # Rule listing is useful for users and documentation
+    if args.list_rules:
+        for meta, _ in RULES:
+            print(f"{meta.id}  [{meta.severity}]  {meta.title}  ({meta.attack})")
+        print("\nAlso: CORR-SUSP-PROC-CHAIN (correlation heuristic)")
+        return EXIT_OK
+
+    # Config file support (optional)
+    try:
+        args = load_config_if_present(args)
+    except Exception:
+        return EXIT_FATAL
+
+    # Determine log paths:
+    # - CLI --logs if provided
+    # - else auto-discovery (Windows)
+    logs = args.logs or autodiscover_evtx()
+
+    if not logs:
+        print("[!] No logs found/provided.")
+        print(r'    Example: python Chap10.py --logs "C:\Windows\System32\winevt\Logs\Security.evtx"')
+        return EXIT_NO_LOGS
+
+    # EVTX parsing dependency check
+    if not EVTX_AVAILABLE:
+        print("[!] Missing dependency: python-evtx")
+        print("    Install: pip install python-evtx")
+        return EXIT_DEP_MISSING
+
+    # Time filters
+    since_dt = parse_user_time(args.since) if args.since else None
+    until_dt = parse_user_time(args.until) if args.until else None
+
+    # Allowlists
+    allow_users = load_lines_file(args.allow_users) if args.allow_users else []
+    allow_ips = load_lines_file(args.allow_ips) if args.allow_ips else []
+
+    # Rule enable/disable
+    enabled = set(args.enable_rules or [])
+    disabled = set(args.disable_rules or [])
+
+    # Build sources (existing files only)
+    sources: List[EvtxSource] = []
+    for pth in logs:
+        if Path(pth).exists():
+            sources.append(EvtxSource(path=pth, source_hint="windows_evtx"))
+        else:
+            log.warning("Log not found: %s", pth)
+
+    if not sources:
+        print("[!] None of the provided logs exist.")
+        return EXIT_NO_LOGS
+
+    # Baseline pass (optional)
+    baseline_obj: Optional[Baseline] = None
+    if args.baseline:
+        baseline_obj = Baseline()
+        log.info("Baseline enabled: first pass building baseline model...")
+        for src in sources:
+            for e in src.iter_events(progress=args.progress):
+                if not within_time(e, since_dt, until_dt):
+                    continue
+                if is_allowlisted_user(e.user, allow_users) or is_allowlisted_ip(e.src_ip, allow_ips):
+                    continue
+                baseline_obj.observe(e)
+
+    # Hunting pass
+    log.info("Hunting %d EVTX file(s)...", len(sources))
+    findings = hunt_sources(
+        sources=sources,
+        since=since_dt,
+        until=until_dt,
+        enabled_rule_ids=enabled if enabled else None,
+        disabled_rule_ids=disabled if disabled else None,
+        baseline=baseline_obj,
+        allow_users=allow_users,
+        allow_ips=allow_ips,
+        progress=args.progress,
+    )
+
+    # Print summary to console
+    print_summary(findings)
+
+    # Optional file output
+    if args.out:
+        try:
+            if args.format == "json":
+                write_json(args.out, findings)
+            elif args.format == "jsonl":
+                write_jsonl(args.out, findings)
+            else:
+                write_csv(args.out, findings)
+            print(f"[+] Wrote {len(findings)} findings -> {args.out} ({args.format})")
+        except Exception as e:
+            print(f"[!] Failed to write output: {e}")
+            return EXIT_FATAL
+
+    # Friendly guidance if nothing fired
+    if not findings:
+        print("\n[i] Tip: If you expected results, try:")
+        print("    - Enable Sysmon and ensure Sysmon Operational EVTX is present")
+        print("    - Run with --baseline to prioritize NEW sources for users")
+        print("    - Provide a wider window (--since/--until)")
+
+    return EXIT_OK
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
