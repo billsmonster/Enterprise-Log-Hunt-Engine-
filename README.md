@@ -1,8 +1,5 @@
 # ELHE — Enterprise Log Hunt Engine (Single-File Threat Hunting Tool)
 
-A **portfolio-ready** Python threat-hunting engine that ingests **Windows EVTX logs (Security + Sysmon)**, normalizes events, enriches them, and runs **behavioral detections** mapped to **MITRE ATT&CK**. It supports **baseline/anomaly hunting**, **allowlists**, **config files**, and **JSON/JSONL/CSV** export — all in **one file**.
-
----
 
 ## What this tool does
 
